@@ -236,17 +236,16 @@ impl Server {
             async move {
                 while let Some(id) = lost_con_rx.recv().await {
                     warn!("lost connection with {id}");
-                    if let Some(session) = state.sessions.write().await.remove(&id) {
-                        if session
+                    if let Some(session) = state.sessions.write().await.remove(&id)
+                        && session
                             .user
                             .session
                             .read()
                             .await
                             .as_ref()
-                            .map_or(false, |it| it.ptr_eq(&Arc::downgrade(&session)))
-                        {
-                            Arc::clone(&session.user).dangle().await;
-                        }
+                            .is_some_and(|it| it.ptr_eq(&Arc::downgrade(&session)))
+                    {
+                        Arc::clone(&session.user).dangle().await;
                     }
                     // 从session_info中移除断开的会话
                     state.session_info.write().await.remove(&id);
