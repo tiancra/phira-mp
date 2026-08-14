@@ -5,6 +5,7 @@ use phira_mp_common::{
     ServerCommand, Stream, TouchFrame, UserInfo, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
 };
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc,
@@ -23,6 +24,29 @@ type Callback<T> = Mutex<Option<oneshot::Sender<T>>>;
 type RCallback<T, E = String> = Mutex<Option<oneshot::Sender<Result<T, E>>>>;
 
 pub const TIMEOUT: Duration = Duration::from_secs(7);
+
+/// 本地谱面同步（LocalChart）触发的事件，由服务端主动推送，上层通过
+/// [`Client::blocking_take_local_chart_events`] 轮询消费。
+#[derive(Clone, Debug)]
+pub enum LocalChartEvent {
+    /// 房间进入 / 退出本地谱面分享状态
+    ChangeLocalChart { local: bool, chart_id: String },
+    /// 房主：服务端要求启动本地下载服务器
+    StartServing { chart_id: String, chart_name: String },
+    /// 玩家：服务端指示从房主下载谱面
+    StartDownload {
+        host_id: i32,
+        host_name: String,
+        addr: String,
+        port: u16,
+        chart_id: String,
+        chart_name: String,
+    },
+    /// 房主：所有玩家都已完成下载
+    HostReady,
+    /// 房主取消了本地谱面分享：所有客户端应重置就绪/开始按钮状态（仍停留在分享阶段）
+    Canceled,
+}
 
 pub struct LivePlayer {
     pub touch_frames: Mutex<Vec<TouchFrame>>,
@@ -58,6 +82,18 @@ struct State {
     cb_cancel_ready: RCallback<()>,
     cb_played: RCallback<()>,
     cb_abort: RCallback<()>,
+
+    cb_select_local_chart: RCallback<()>,
+    cb_select_online_chart: RCallback<()>,
+    cb_send_chart: RCallback<()>,
+    cb_download_ready: RCallback<()>,
+    cb_cancel_local_chart: RCallback<()>,
+    cb_cancel_download_ready: RCallback<()>,
+
+    cb_upload_chart: RCallback<()>,
+    cb_download_chart: RCallback<Vec<u8>>,
+
+    local_chart_events: Mutex<VecDeque<LocalChartEvent>>,
 
     live_players: DashMap<i32, Arc<LivePlayer>>,
     messages: Mutex<Vec<Message>>,
@@ -107,6 +143,18 @@ impl Client {
             cb_cancel_ready: Callback::default(),
             cb_played: Callback::default(),
             cb_abort: Callback::default(),
+
+            cb_select_local_chart: Callback::default(),
+            cb_select_online_chart: Callback::default(),
+            cb_send_chart: Callback::default(),
+            cb_download_ready: Callback::default(),
+            cb_cancel_local_chart: Callback::default(),
+            cb_cancel_download_ready: Callback::default(),
+
+            cb_upload_chart: Callback::default(),
+            cb_download_chart: Callback::default(),
+
+            local_chart_events: Mutex::default(),
 
             live_players: DashMap::new(),
             messages: Mutex::default(),
@@ -346,6 +394,89 @@ impl Client {
     }
 
     #[inline]
+    pub async fn select_local_chart(&self, id: impl Into<String>, name: impl Into<String>) -> Result<()> {
+        self.rcall(
+            ClientCommand::SelectLocalChart {
+                id: id.into().try_into()?,
+                name: name.into().try_into()?,
+            },
+            &self.state.cb_select_local_chart,
+        )
+        .await
+    }
+
+    #[inline]
+    pub async fn select_online_chart(&self, id: i32) -> Result<()> {
+        self.rcall(
+            ClientCommand::SelectOnlineChart { id },
+            &self.state.cb_select_online_chart,
+        )
+        .await
+    }
+
+    #[inline]
+    pub async fn send_chart(&self, addr: impl Into<String>, port: u16) -> Result<()> {
+        self.rcall(
+            ClientCommand::SendChart {
+                addr: addr.into(),
+                port,
+            },
+            &self.state.cb_send_chart,
+        )
+        .await
+    }
+
+    #[inline]
+    pub async fn download_ready(&self) -> Result<()> {
+        self.rcall(ClientCommand::DownloadReady, &self.state.cb_download_ready)
+            .await
+    }
+
+    /// 房主取消本地谱面分享（删除服务端缓存、重置所有玩家就绪）
+    #[inline]
+    pub async fn cancel_local_chart(&self) -> Result<()> {
+        self.rcall(ClientCommand::CancelLocalChart, &self.state.cb_cancel_local_chart)
+            .await
+    }
+
+    /// 玩家取消已就绪（尚未开始游玩前可取消）
+    #[inline]
+    pub async fn cancel_download_ready(&self) -> Result<()> {
+        self.rcall(ClientCommand::CancelDownloadReady, &self.state.cb_cancel_download_ready)
+            .await
+    }
+
+    /// 上传本地谱面包到服务端（经 game 连接，兼容内网穿透）
+    #[inline]
+    pub async fn upload_chart(&self, id: impl Into<String>, data: Vec<u8>) -> Result<()> {
+        self.rcall(
+            ClientCommand::UploadChart {
+                id: id.into().try_into()?,
+                data,
+            },
+            &self.state.cb_upload_chart,
+        )
+        .await
+    }
+
+    /// 从服务端获取谱面包（经 game 连接）
+    #[inline]
+    pub async fn download_chart(&self, id: impl Into<String>) -> Result<Vec<u8>> {
+        self.rcall(
+            ClientCommand::DownloadChart {
+                id: id.into().try_into()?,
+            },
+            &self.state.cb_download_chart,
+        )
+        .await
+    }
+
+    /// 取走所有尚未被上层消费的本地谱面同步事件
+    pub fn blocking_take_local_chart_events(&self) -> Vec<LocalChartEvent> {
+        self.state.local_chart_events.blocking_lock().drain(..).collect()
+    }
+
+    #[inline]
     pub async fn request_start(&self) -> Result<()> {
         self.rcall(ClientCommand::RequestStart, &self.state.cb_request_start)
             .await?;
@@ -505,6 +636,80 @@ async fn process(state: Arc<State>, cmd: ServerCommand) {
         }
         ServerCommand::Abort(res) => {
             cb(&state.cb_abort, res).await;
+        }
+
+        ServerCommand::ChangeLocalChart { local, chart_id } => {
+            state
+                .local_chart_events
+                .lock()
+                .await
+                .push_back(LocalChartEvent::ChangeLocalChart { local, chart_id });
+        }
+        ServerCommand::StartServing { chart_id, chart_name } => {
+            state
+                .local_chart_events
+                .lock()
+                .await
+                .push_back(LocalChartEvent::StartServing { chart_id, chart_name });
+        }
+        ServerCommand::StartDownload {
+            host_id,
+            host_name,
+            addr,
+            port,
+            chart_id,
+            chart_name,
+        } => {
+            state
+                .local_chart_events
+                .lock()
+                .await
+                .push_back(LocalChartEvent::StartDownload {
+                    host_id,
+                    host_name,
+                    addr,
+                    port,
+                    chart_id,
+                    chart_name,
+                });
+        }
+        ServerCommand::HostReady => {
+            state
+                .local_chart_events
+                .lock()
+                .await
+                .push_back(LocalChartEvent::HostReady);
+        }
+        ServerCommand::LocalChartCanceled => {
+            state
+                .local_chart_events
+                .lock()
+                .await
+                .push_back(LocalChartEvent::Canceled);
+        }
+        ServerCommand::SelectLocalChart(res) => {
+            cb(&state.cb_select_local_chart, res).await;
+        }
+        ServerCommand::SelectOnlineChart(res) => {
+            cb(&state.cb_select_online_chart, res).await;
+        }
+        ServerCommand::SendChart(res) => {
+            cb(&state.cb_send_chart, res).await;
+        }
+        ServerCommand::DownloadReady(res) => {
+            cb(&state.cb_download_ready, res).await;
+        }
+        ServerCommand::CancelLocalChart(res) => {
+            cb(&state.cb_cancel_local_chart, res).await;
+        }
+        ServerCommand::CancelDownloadReady(res) => {
+            cb(&state.cb_cancel_download_ready, res).await;
+        }
+        ServerCommand::UploadChart(res) => {
+            cb(&state.cb_upload_chart, res).await;
+        }
+        ServerCommand::DownloadChart(res) => {
+            cb(&state.cb_download_chart, res).await;
         }
     }
 }

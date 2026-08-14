@@ -118,7 +118,7 @@ where
                             bail!("invalid length");
                         }
                     }
-                    if len > 2 * 1024 * 1024 {
+                    if len > 512 * 1024 * 1024 {
                         bail!("data packet too large");
                     }
                     let len = len as usize;
@@ -165,6 +165,11 @@ where
     pub fn blocking_send(&self, payload: S) -> Result<()> {
         self.send_tx.blocking_send(payload)?;
         Ok(())
+    }
+    
+    pub fn close(&self) {
+        self.send_task_handle.abort();
+        self.recv_task_handle.abort();
     }
 }
 
