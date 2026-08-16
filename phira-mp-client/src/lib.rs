@@ -26,6 +26,8 @@ type Callback<T> = Mutex<Option<oneshot::Sender<T>>>;
 type RCallback<T, E = String> = Mutex<Option<oneshot::Sender<Result<T, E>>>>;
 
 pub const TIMEOUT: Duration = Duration::from_secs(7);
+/// 本地谱面上传/下载等大数据传输的超时（经 game 连接传整个 zip，需更长）。
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 本地谱面同步（LocalChart）触发的事件，由服务端主动推送，上层通过
 /// [`Client::blocking_take_local_chart_events`] 轮询消费。
@@ -296,10 +298,19 @@ impl Client {
     }
 
     async fn rcall<R>(&self, payload: ClientCommand, cb: &RCallback<R>) -> Result<R> {
+        self.rcall_with_timeout(payload, cb, TIMEOUT).await
+    }
+
+    async fn rcall_with_timeout<R>(
+        &self,
+        payload: ClientCommand,
+        cb: &RCallback<R>,
+        timeout: Duration,
+    ) -> Result<R> {
         self.stream.send(payload).await?;
         let (tx, rx) = oneshot::channel();
         *cb.lock().await = Some(tx);
-        time::timeout(TIMEOUT, rx)
+        time::timeout(timeout, rx)
             .await
             .context("timeout")??
             .map_err(Error::msg)
@@ -464,12 +475,13 @@ impl Client {
     /// 上传本地谱面包到服务端（经 game 连接，兼容内网穿透）
     #[inline]
     pub async fn upload_chart(&self, id: impl Into<String>, data: Vec<u8>) -> Result<()> {
-        self.rcall(
+        self.rcall_with_timeout(
             ClientCommand::UploadChart {
                 id: id.into().try_into()?,
                 data,
             },
             &self.state.cb_upload_chart,
+            TRANSFER_TIMEOUT,
         )
         .await
     }
@@ -477,11 +489,12 @@ impl Client {
     /// 从服务端获取谱面包（经 game 连接）
     #[inline]
     pub async fn download_chart(&self, id: impl Into<String>) -> Result<Vec<u8>> {
-        self.rcall(
+        self.rcall_with_timeout(
             ClientCommand::DownloadChart {
                 id: id.into().try_into()?,
             },
             &self.state.cb_download_chart,
+            TRANSFER_TIMEOUT,
         )
         .await
     }
