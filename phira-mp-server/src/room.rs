@@ -8,7 +8,6 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::sync::RwLock;

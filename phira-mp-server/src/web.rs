@@ -2762,7 +2762,7 @@ async fn login_handler(
         // 生成一个简单的token（实际应用中应使用更安全的token生成方法）
         let mut rng = rand::thread_rng();
         let token: String = (0..32)
-            .map(|_| format!("{:x}", rng.gen::<u8>() % 16))
+            .map(|_| format!("{:x}", rng.r#gen::<u8>() % 16))
             .collect();
         
         // 在实际应用中，应该将token存储在内存或数据库中，以便后续验证
