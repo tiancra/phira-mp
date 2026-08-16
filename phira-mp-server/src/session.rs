@@ -176,10 +176,7 @@ impl Session {
                         if waiting_for_authenticate.load(Ordering::SeqCst) {
                             if let ClientCommand::Authenticate { token } = cmd {
                                 let Some(tx) = tx else { return };
-<<<<<<< HEAD
                                 
-                                // 检查IP是否在黑名单中（再次检查以确保最新状态）
-                                let blacklist = server.ip_blacklist.read().await                                
                                 // 检查IP是否在黑名单中（再次检查以确保最新状态）
                                 let blacklist = server.ip_blacklist.read().await;
                                 let ip_in_blacklist = if let Some(expiry_time) = blacklist.get(&ip_str_clone) {
@@ -193,7 +190,11 @@ impl Session {
                                 if is_blacklisted_clone || ip_in_blacklist {
                                     // IP在黑名单中，发送403错误
                                     warn!("拒绝来自黑名单IP {ip_str_clone} 的认证请求");
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                    let _ = send_tx
+                                        .send(ServerCommand::Authenticate(Err("该账号已被封禁，无法连接该服务器".to_string())))
+                                        .await;
+                                    // 等待0.5秒让消息发送完成
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                     // 设置恐慌状态以断开连接
                                     panicked.store(true, Ordering::SeqCst);
                                     if let Err(err) = server.lost_con_tx.send(id).await {
@@ -741,14 +742,26 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                     bail!("already in room");
                 }
                 let room = user.server.rooms.read().await.get(&id).map(Arc::clone);
-<<<<<<< HEAD
                 let Some(room) = room else { bail!("芙宁娜都还没开房间呢，这么着急干啥？") };
-=======
-                let Some(room) = room else {
-                    bail!("room not found")
-                };
->>>>>>> cc822df1c9e2d151b4323cc6c97da68e882b681f
-     user.monitor.store(monitor, Ordering::SeqCst);
+                if room.locked.load(Ordering::SeqCst) {
+                    bail!(tl!("join-room-locked"));
+                }
+                if !matches!(*room.state.read().await, InternalRoomState::SelectChart) {
+                    bail!(tl!("join-game-ongoing"));
+                }
+                if monitor && !user.can_monitor() {
+                    bail!(tl!("join-cant-monitor"));
+                }
+                if !room.add_user(Arc::downgrade(&user), monitor).await {
+                    bail!(tl!("join-room-full"));
+                }
+                info!(
+                    user = user.id,
+                    room = id.to_string(),
+                    monitor,
+                    "user join room"
+                );
+                user.monitor.store(monitor, Ordering::SeqCst);
                 if monitor && !room.live.fetch_or(true, Ordering::SeqCst) {
                     info!(room = id.to_string(), "room goes live");
                 }
@@ -760,8 +773,12 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                 } else {
                     "".to_string()
                 };
-                      let Some(room) = room else { bail!("芙宁娜都还没开房间呢，这么着急干啥？") };
-oinRoom {
+                room.broadcast(ServerCommand::Message(Message::Chat {
+                    user: 0, // 使用0表示系统消息
+                    content: format!("欢迎 {} 加入房间！{}", user.name, web_url),
+                }))
+                .await;
+                room.send(Message::JoinRoom {
                     user: user.id,
                     name: user.name.clone(),
                 })
