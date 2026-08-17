@@ -645,6 +645,12 @@ impl Room {
                             new_host.try_send(ServerCommand::ChangeHost(true)).await;
                         }
                     }
+                    // 清空本地谱面残留状态并通知所有客户端退出本地谱面分享，
+                    // 避免本地谱面游玩结束后切换到在线谱面时状态错乱（卡在转圈/无法开始）。
+                    *self.local_chart.write().await = None;
+                    self.chart_uploaded.store(false, Ordering::SeqCst);
+                    self.broadcast(ServerCommand::ChangeLocalChart { local: false, chart_id: String::new() })
+                        .await;
                     self.on_state_change().await;
                 }
             }
