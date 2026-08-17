@@ -16,8 +16,7 @@ use tracing::{error, trace, warn};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
-// 放宽断开超时，避免 Android 等环境下拉取/下载谱面等短暂卡顿期间连接被服务端误丢
-pub const HEARTBEAT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const HEARTBEAT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn encode_packet(payload: &impl BinaryData, vec: &mut Vec<u8>) {
     BinaryWriter::new(vec).write(payload).unwrap();
