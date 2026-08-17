@@ -92,15 +92,21 @@ impl User {
         let room = guard.as_ref().map(Arc::clone);
         drop(guard);
         if let Some(room) = room {
-            let guard = room.state.read().await;
-            if matches!(*guard, InternalRoomState::Playing { .. }) {
-                warn!(user = self.id, "lost connection on playing, aborting");
-                self.server.users.write().await.remove(&self.id);
-                drop(guard);
-                if room.on_user_leave(&self).await {
-                    self.server.rooms.write().await.remove(&room.id);
+            let playing = matches!(*room.state.read().await, InternalRoomState::Playing { .. });
+            if playing {
+                // 多人房间：游玩中断连立即中止并移除该玩家，避免拖住其他玩家结算。
+                // 单人房间：若只剩该玩家，保留房间并落入下方 10 秒重连宽限逻辑，
+                // 避免一次短暂断连/重连就摧毁整个房间，否则游玩结束后离开房间
+                // 会因 user.room 已为 None 而得到 "no room" 报错。
+                let solo = room.users().await.len() <= 1;
+                if !solo {
+                    warn!(user = self.id, "lost connection on playing, aborting");
+                    self.server.users.write().await.remove(&self.id);
+                    if room.on_user_leave(&self).await {
+                        self.server.rooms.write().await.remove(&room.id);
+                    }
+                    return;
                 }
-                return;
             }
         }
         let dangle_mark = Arc::new(());
@@ -823,11 +829,13 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         }
         ClientCommand::LeaveRoom => {
             let res: Result<()> = async move {
-                get_room!(room);
-                // TODO is this necessary?
-                // if !matches!(*room.state.read().await, InternalRoomState::SelectChart) {
-                // bail!("game ongoing, can't leave");
-                // }
+                // 若用户已不在任何房间（例如单人房间游玩中断连导致房间被清理，
+                // user.room 已为 None），离开应视为成功的空操作，而不是返回
+                // "no room" 报错，否则客户端将无法退出并一直看到该错误。
+                let Some(room) = user.room.read().await.as_ref().map(Arc::clone) else {
+                    info!(user = user.id, "user not in any room, leave is no-op");
+                    return Ok(());
+                };
                 info!(
                     user = user.id,
                     room = room.id.to_string(),
