@@ -331,26 +331,6 @@ impl Room {
         let _ = self.judgement_tx.send("[]".to_string());
     }
 
-    // 玩家游玩结束后，用客户端上报的真实成绩回填判定统计，
-    // 使管理端 Judge 显示真实分数/准确率/判定数/最大连击。
-    pub async fn update_final_stats(&self, user_id: i32, user_name: String, record: &Record) {
-        let mut stats = self.judgement_stats.write().await;
-        let s = stats
-            .entry(user_id)
-            .or_insert_with(|| PlayerJudgementStats::new(user_id, user_name));
-        s.perfect = record.perfect.max(0) as u32;
-        s.good = record.good.max(0) as u32;
-        s.bad = record.bad.max(0) as u32;
-        s.miss = record.miss.max(0) as u32;
-        s.max_combo = record.max_combo.max(0) as u32;
-        s.current_combo = record.max_combo.max(0) as u32;
-        s.score = record.score.max(0) as u32;
-        s.accuracy = record.accuracy;
-        let stats_vec: Vec<&PlayerJudgementStats> = stats.values().collect();
-        let stats_json = serde_json::to_string(&stats_vec).unwrap_or_default();
-        let _ = self.judgement_tx.send(stats_json);
-    }
-
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::SeqCst)
     }

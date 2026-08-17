@@ -143,17 +143,10 @@ impl Session {
         let this = Arc::new(OnceCell::<Arc<Session>>::new());
         let this_inited = Arc::new(Notify::new());
         let (tx, rx) = oneshot::channel::<Arc<User>>();
-        let last_recv: Arc<std::sync::Mutex<Instant>> = Arc::new(std::sync::Mutex::new(Instant::now()));
-        // 大帧（如本地谱面包上传）接收期间也要持续刷新心跳时间戳，
-        // 否则一次较慢的大帧传输会触发心跳超时，被误判为掉线并销毁房间。
-        let activity_last_recv = Arc::clone(&last_recv);
-        let activity: Option<Arc<dyn Fn() + Send + Sync>> = Some(Arc::new(move || {
-            *activity_last_recv.lock().unwrap() = Instant::now();
-        }));
+        let last_recv: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
         let stream = Stream::<ServerCommand, ClientCommand>::new(
             None,
             stream,
-            activity,
             Box::new({
                 let this = Arc::clone(&this);
                 let this_inited = Arc::clone(&this_inited);
@@ -179,7 +172,7 @@ impl Session {
                     let is_blacklisted_clone = ip_is_blacklisted;
                     
                     async move {
-                        *last_recv.lock().unwrap() = Instant::now();
+                        *last_recv.lock().await = Instant::now();
                         if panicked.load(Ordering::SeqCst) {
                             return;
                         }
@@ -413,10 +406,10 @@ impl Session {
             let last_recv = Arc::clone(&last_recv);
             async move {
                 loop {
-                    let recv = *last_recv.lock().unwrap();
+                    let recv = *last_recv.lock().await;
                     time::sleep_until((recv + HEARTBEAT_DISCONNECT_TIMEOUT).into()).await;
 
-                    if *last_recv.lock().unwrap() + HEARTBEAT_DISCONNECT_TIMEOUT > Instant::now() {
+                    if *last_recv.lock().await + HEARTBEAT_DISCONNECT_TIMEOUT > Instant::now() {
                         continue;
                     }
 
@@ -1308,36 +1301,27 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
             .await;
             Some(ServerCommand::CancelReady(err_to_str(res)))
         }
-        ClientCommand::Played { id, score, accuracy, full_combo, max_combo, perfect, good, bad, miss } => {
+        ClientCommand::Played { id } => {
             let res: Result<()> = async move {
                 get_room!(room);
-                // 客户端直接上报真实成绩（不再回源 {HOST}/record/{id}），本地谱面同样可用
-                let record = Record {
-                    id,
-                    player: user.id,
-                    score: score as i32,
-                    perfect: perfect as i32,
-                    good: good as i32,
-                    bad: bad as i32,
-                    miss: miss as i32,
-                    max_combo: max_combo as i32,
-                    accuracy,
-                    full_combo,
-                    std: 0.,
-                    std_score: 0.,
-                };
+                let res: Record = reqwest::get(format!("{HOST}/record/{id}"))
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                if res.player != user.id {
+                    bail!("invalid record");
+                }
                 debug!(
                     room = room.id.to_string(),
                     user = user.id,
-                    "user played: {record:?}"
+                    "user played: {res:?}"
                 );
-                // 回填判定统计，使管理端 Judge 显示真实分数
-                room.update_final_stats(user.id, user.name.clone(), &record).await;
                 room.send(Message::Played {
                     user: user.id,
-                    score: record.score,
-                    accuracy: record.accuracy,
-                    full_combo: record.full_combo,
+                    score: res.score,
+                    accuracy: res.accuracy,
+                    full_combo: res.full_combo,
                 })
                 .await;
                 let mut guard = room.state.write().await;
@@ -1345,7 +1329,7 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                     if aborted.contains(&user.id) {
                         bail!("aborted");
                     }
-                    if results.insert(user.id, record).is_some() {
+                    if results.insert(user.id, res).is_some() {
                         bail!("already uploaded");
                     }
                     

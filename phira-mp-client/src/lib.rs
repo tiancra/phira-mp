@@ -173,6 +173,7 @@ impl Client {
             Stream::new(
                 Some(1),
                 stream,
+                None,
                 Box::new({
                     let state = Arc::clone(&state);
                     move |_send_tx, cmd| process(Arc::clone(&state), cmd)
@@ -529,9 +530,33 @@ impl Client {
     }
 
     #[inline]
-    pub async fn played(&self, id: i32) -> Result<()> {
-        self.rcall(ClientCommand::Played { id }, &self.state.cb_played)
-            .await
+    pub async fn played(
+        &self,
+        id: i32,
+        score: u32,
+        accuracy: f32,
+        full_combo: bool,
+        max_combo: u32,
+        perfect: u32,
+        good: u32,
+        bad: u32,
+        miss: u32,
+    ) -> Result<()> {
+        self.rcall(
+            ClientCommand::Played {
+                id,
+                score,
+                accuracy,
+                full_combo,
+                max_combo,
+                perfect,
+                good,
+                bad,
+                miss,
+            },
+            &self.state.cb_played,
+        )
+        .await
     }
 
     #[inline]
