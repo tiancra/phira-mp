@@ -543,7 +543,7 @@ impl Client {
         miss: u32,
     ) -> Result<()> {
         self.rcall(
-            ClientCommand::Played {
+            ClientCommand::PlayedWithScore {
                 id,
                 score,
                 accuracy,

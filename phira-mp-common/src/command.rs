@@ -173,17 +173,7 @@ pub enum ClientCommand {
     RequestStart,
     Ready,
     CancelReady,
-    Played {
-        id: i32,
-        score: u32,
-        accuracy: f32,
-        full_combo: bool,
-        max_combo: u32,
-        perfect: u32,
-        good: u32,
-        bad: u32,
-        miss: u32,
-    },
+    Played { id: i32 },
     Abort,
 
     // LocalChart: 房主选择本地谱面分享给房间内玩家（id 为随机 UUID，8-4-4-4-12）
@@ -203,6 +193,19 @@ pub enum ClientCommand {
     CancelLocalChart,
     // LocalChart: 玩家取消已就绪（尚未开始游玩前可取消）
     CancelDownloadReady,
+
+    // 新版客户端直传最终成绩；追加在枚举末尾，保持原版命令编号兼容。
+    PlayedWithScore {
+        id: i32,
+        score: u32,
+        accuracy: f32,
+        full_combo: bool,
+        max_combo: u32,
+        perfect: u32,
+        good: u32,
+        bad: u32,
+        miss: u32,
+    },
 }
 
 #[derive(Clone, Debug, BinaryData)]

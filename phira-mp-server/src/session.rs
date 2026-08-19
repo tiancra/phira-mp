@@ -49,14 +49,11 @@ impl User {
             id,
             name,
             lang,
-
             server,
             session: RwLock::default(),
             room: RwLock::default(),
-
             monitor: AtomicBool::default(),
             game_time: AtomicU32::default(),
-
             dangle_mark: Mutex::default(),
         }
     }
@@ -461,6 +458,103 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.monitor_task_handle.abort();
     }
+}
+
+async fn handle_played_score(
+    user: Arc<User>,
+    id: i32,
+    score: u32,
+    accuracy: f32,
+    full_combo: bool,
+    max_combo: u32,
+    perfect: u32,
+    good: u32,
+    bad: u32,
+    miss: u32,
+) -> Result<()> {
+    let room = user
+        .room
+        .read()
+        .await
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| anyhow!("芙宁娜的房间已经关了"))?;
+    let record = Record {
+        id,
+        player: user.id,
+        score: score as i32,
+        perfect: perfect as i32,
+        good: good as i32,
+        bad: bad as i32,
+        miss: miss as i32,
+        max_combo: max_combo as i32,
+        accuracy,
+        full_combo,
+        std: 0.,
+        std_score: 0.,
+    };
+    debug!(room = room.id.to_string(), user = user.id, "user played: {record:?}");
+    room.update_final_stats(user.id, user.name.clone(), &record).await;
+    room.send(Message::Played {
+        user: user.id,
+        score: record.score,
+        accuracy: record.accuracy,
+        full_combo: record.full_combo,
+    })
+    .await;
+
+    let mut guard = room.state.write().await;
+    if let InternalRoomState::Playing { results, aborted } = guard.deref_mut() {
+        if aborted.contains(&user.id) {
+            bail!("aborted");
+        }
+        if results.insert(user.id, record).is_some() {
+            bail!("already uploaded");
+        }
+        let users = room.users().await;
+        let all_finished = users
+            .iter()
+            .all(|it| results.contains_key(&it.id) || aborted.contains(&it.id));
+        info!(
+            room_id = %room.id.to_string(),
+            user_count = users.len(),
+            results_count = results.len(),
+            aborted_count = aborted.len(),
+            all_finished = all_finished,
+            "Checking if all players finished"
+        );
+        drop(guard);
+        room.check_all_ready().await;
+
+        if all_finished {
+            info!(room_id = %room.id.to_string(), "All players finished, will save and upload replays");
+            let room_id = room.id.to_string();
+            let server = Arc::clone(&user.server);
+            let upload_config = server.config.upload.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut replay_manager = server.replay_manager.write().await;
+                if upload_config.enabled && !upload_config.api_token.is_empty() {
+                    match replay_manager.save_and_upload_replays(&room_id, &upload_config.api_url, &upload_config.api_token).await {
+                        Ok(results) => {
+                            let saved_count = results.len();
+                            let uploaded_count = results.iter().filter(|(_, r)| r.is_some()).count();
+                            let success_count = results.iter().filter(|(_, r)| r.as_ref().map(|r| r.success).unwrap_or(false)).count();
+                            info!(room_id = %room_id, saved = saved_count, uploaded = uploaded_count, success = success_count, "Saved and uploaded replay recordings");
+                        }
+                        Err(e) => error!(room_id = %room_id, error = %e, "Failed to save and upload replay recordings"),
+                    }
+                } else {
+                    match replay_manager.save_replays(&room_id).await {
+                        Ok(paths) => info!(room_id = %room_id, file_count = paths.len(), "Saved replay recordings (upload disabled)"),
+                        Err(e) => error!(room_id = %room_id, error = %e, "Failed to save replay recordings"),
+                    }
+                }
+                replay_manager.remove_room_manager(&room_id);
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
@@ -1308,128 +1402,61 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
             .await;
             Some(ServerCommand::CancelReady(err_to_str(res)))
         }
-        ClientCommand::Played { id, score, accuracy, full_combo, max_combo, perfect, good, bad, miss } => {
-            let res: Result<()> = async move {
-                get_room!(room);
-                // 客户端直传的真实成绩（用于本地谱面 / 成绩展示 / 管理端 Judge）
-                let mut record = Record {
-                    id,
-                    player: user.id,
-                    score: score as i32,
-                    perfect: perfect as i32,
-                    good: good as i32,
-                    bad: bad as i32,
-                    miss: miss as i32,
-                    max_combo: max_combo as i32,
-                    accuracy,
-                    full_combo,
-                    std: 0.,
-                    std_score: 0.,
-                };
-                // 原版成绩上传路径：若客户端有在线 record id（经 /play/upload 获得），回源 Phira 拉取官方记录
-                if id != -1 {
-                    match reqwest::get(format!("{HOST}/record/{id}"))
-                        .await
-                        .and_then(|r| r.error_for_status())
-                        .and_then(|r| r.json::<Record>().await)
-                    {
-                        Ok(remote) if remote.player == user.id => {
-                            record = remote;
-                            debug!(room = room.id.to_string(), user = user.id, "user played (official record): {record:?}");
-                        }
-                        _ => {
-                            debug!(room = room.id.to_string(), user = user.id, "official record fetch failed, using client score");
-                        }
-                    }
-                }
-                debug!(
-                    room = room.id.to_string(),
-                    user = user.id,
-                    "user played: {record:?}"
-                );
-                // 回填判定统计，使管理端 Judge 显示真实分数
-                room.update_final_stats(user.id, user.name.clone(), &record).await;
-                room.send(Message::Played {
-                    user: user.id,
-                    score: record.score,
-                    accuracy: record.accuracy,
-                    full_combo: record.full_combo,
-                })
-                .await;
-                let mut guard = room.state.write().await;
-                if let InternalRoomState::Playing { results, aborted } = guard.deref_mut() {
-                    if aborted.contains(&user.id) {
-                        bail!("aborted");
-                    }
-                    if results.insert(user.id, record).is_some() {
-                        bail!("already uploaded");
-                    }
-                    
-                    // 检查是否所有玩家都完成了
-                    let users = room.users().await;
-                    let all_finished = users
-                        .iter()
-                        .all(|it| results.contains_key(&it.id) || aborted.contains(&it.id));
-                    
-                    info!(
-                        room_id = %room.id.to_string(),
-                        user_count = users.len(),
-                        results_count = results.len(),
-                        aborted_count = aborted.len(),
-                        all_finished = all_finished,
-                        "Checking if all players finished"
-                    );
-                    
-                    drop(guard);
-                    room.check_all_ready().await;
-                    
-                    // 如果游戏结束，保存并上传回放
-                    if all_finished {
-                        info!(room_id = %room.id.to_string(), "All players finished, will save and upload replays");
-                        let room_id = room.id.to_string();
-                        let server = Arc::clone(&user.server);
-                        let upload_config = server.config.upload.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            let mut replay_manager = server.replay_manager.write().await;
-                            
-                            // 如果启用了自动上传，使用上传方法
-                            if upload_config.enabled && !upload_config.api_token.is_empty() {
-                                match replay_manager.save_and_upload_replays(&room_id, &upload_config.api_url, &upload_config.api_token).await {
-                                    Ok(results) => {
-                                        let saved_count = results.len();
-                                        let uploaded_count = results.iter().filter(|(_, r)| r.is_some()).count();
-                                        let success_count = results.iter().filter(|(_, r)| r.as_ref().map(|r| r.success).unwrap_or(false)).count();
-                                        info!(
-                                            room_id = %room_id,
-                                            saved = saved_count,
-                                            uploaded = uploaded_count,
-                                            success = success_count,
-                                            "Saved and uploaded replay recordings"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(room_id = %room_id, error = %e, "Failed to save and upload replay recordings");
-                                    }
-                                }
-                            } else {
-                                // 未启用上传，仅保存本地
-                                match replay_manager.save_replays(&room_id).await {
-                                    Ok(paths) => {
-                                        info!(room_id = %room_id, file_count = paths.len(), "Saved replay recordings (upload disabled)");
-                                    }
-                                    Err(e) => {
-                                        error!(room_id = %room_id, error = %e, "Failed to save replay recordings");
-                                    }
-                                }
-                            }
-                            // 清理房间回放管理器
-                            replay_manager.remove_room_manager(&room_id);
-                        });
-                    }
-                }
-                Ok(())
+        ClientCommand::Played { id } => {
+            let user_id = user.id;
+            // 无官方 record id（-1）时没有可回源的成绩，直接返回成功，不请求 /record/-1。
+            if id == -1 {
+                return Some(ServerCommand::Played(Ok(())));
             }
+            tokio::spawn(async move {
+                let fetched: Result<Record> = async {
+                    let res: Record = reqwest::get(format!("{HOST}/record/{id}"))
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    if res.player != user_id {
+                        bail!("invalid record");
+                    }
+                    Ok(res)
+                }
+                .await;
+                match fetched {
+                    Ok(record) => {
+                        let _ = handle_played_score(
+                            user,
+                            record.id,
+                            record.score.max(0) as u32,
+                            record.accuracy,
+                            record.full_combo,
+                            record.max_combo.max(0) as u32,
+                            record.perfect.max(0) as u32,
+                            record.good.max(0) as u32,
+                            record.bad.max(0) as u32,
+                            record.miss.max(0) as u32,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        warn!(user = user_id, record = id, "failed to fetch official record: {err:?}");
+                    }
+                }
+            });
+            Some(ServerCommand::Played(Ok(())))
+        }
+        ClientCommand::PlayedWithScore { id, score, accuracy, full_combo, max_combo, perfect, good, bad, miss } => {
+            let res = handle_played_score(
+                user,
+                id,
+                score,
+                accuracy,
+                full_combo,
+                max_combo,
+                perfect,
+                good,
+                bad,
+                miss,
+            )
             .await;
             Some(ServerCommand::Played(err_to_str(res)))
         }
