@@ -1311,8 +1311,8 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
         ClientCommand::Played { id, score, accuracy, full_combo, max_combo, perfect, good, bad, miss } => {
             let res: Result<()> = async move {
                 get_room!(room);
-                // 客户端直接上报真实成绩（不再回源 {HOST}/record/{id}），本地谱面同样可用
-                let record = Record {
+                // 客户端直传的真实成绩（用于本地谱面 / 成绩展示 / 管理端 Judge）
+                let mut record = Record {
                     id,
                     player: user.id,
                     score: score as i32,
@@ -1326,6 +1326,22 @@ async fn process(user: Arc<User>, cmd: ClientCommand) -> Option<ServerCommand> {
                     std: 0.,
                     std_score: 0.,
                 };
+                // 原版成绩上传路径：若客户端有在线 record id（经 /play/upload 获得），回源 Phira 拉取官方记录
+                if id != -1 {
+                    match reqwest::get(format!("{HOST}/record/{id}"))
+                        .await
+                        .and_then(|r| r.error_for_status())
+                        .and_then(|r| r.json::<Record>().await)
+                    {
+                        Ok(remote) if remote.player == user.id => {
+                            record = remote;
+                            debug!(room = room.id.to_string(), user = user.id, "user played (official record): {record:?}");
+                        }
+                        _ => {
+                            debug!(room = room.id.to_string(), user = user.id, "official record fetch failed, using client score");
+                        }
+                    }
+                }
                 debug!(
                     room = room.id.to_string(),
                     user = user.id,
